@@ -19,7 +19,7 @@ if __name__ == "__main__":
     # %%
     # Number of cardiac frames and step size; downstream scripts must use the same values.
     N_FRAMES = 21
-    FRAME_STEP = 1
+    FRAME_STEP = 3  # Orion (CPU) : 7 phases sur 21, une sur trois.
 
     data_dir = _HERE.parent.parent / "data" / "Slicer-Heart-CT"
 
@@ -31,6 +31,7 @@ if __name__ == "__main__":
 
     # %%
     seg = SegmentChestTotalSegmentatorWithContrast()
+    seg.set_fast_mode(True)  # Orion (CPU) : TotalSegmentator rapide, tache 'total' seule.
     result = seg.segment(fixed_image)
     # %%
     labelmap_mask = result["labelmap"]
@@ -79,6 +80,11 @@ if __name__ == "__main__":
 
     # %%
     for i in range(0, N_FRAMES, FRAME_STEP):
+        # Orion : reprise apres interruption, la phase deja recalee est gardee
+        # (ce fichier est le dernier ecrit pour chaque phase).
+        if (output_dir / f"slice_{i:03d}.reg_static_anatomy.inverse.hdf").exists():
+            print(f"Slice {i:03d} deja traitee : reprise")
+            continue
         print(f"Processing slice {i:03d}")
         moving_image = itk.imread(str(data_dir / f"slice_{i:03d}.mha"))
         result = seg.segment(moving_image)

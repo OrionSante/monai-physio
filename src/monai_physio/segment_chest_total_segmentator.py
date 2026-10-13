@@ -343,13 +343,20 @@ class SegmentChestTotalSegmentator(SegmentAnatomyBase):
             # nr_thr_resamp defaults to 1; TotalSegmentator's post-prediction
             # resampling back to native resolution is CPU-bound and benefits
             # from parallelizing across the available cores.
-            resamp_threads = min(12, os.cpu_count() or 1)
+            # Orion : bornes reglables par variable d'environnement. Chaque
+            # processus de TotalSegmentator recharge torch ; sur une machine a
+            # 16 Go, les valeurs par defaut (12 et 6) epuisent la memoire.
+            resamp_threads = int(
+                os.environ.get("MONAI_PHYSIO_TS_RESAMP_THREADS", min(12, os.cpu_count() or 1))
+            )
+            save_threads = int(os.environ.get("MONAI_PHYSIO_TS_SAVE_THREADS", 6))
             output_nib_image_total = totalsegmentator(
                 nib_image,
                 task="total",
                 device="gpu:0",
                 fast=self.fast_mode,
                 nr_thr_resamp=resamp_threads,
+                nr_thr_saving=save_threads,
             )
             labelmap_arr_total = output_nib_image_total.get_fdata().astype(np.uint8)
 
