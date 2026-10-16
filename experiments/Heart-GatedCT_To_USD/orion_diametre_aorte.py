@@ -58,8 +58,15 @@ CE QUE CA NE DIT PAS
 - Scanner public (Slicer-Heart-CT), pas un patient Orion ; toute valeur reste
   a confirmer par un radiologue.
 
-Sorties : ``results/orion_diametre_aorte.json`` (profil par source) et
-``results/orion_diametre_aorte.png`` (image de controle avant / apres).
+Sorties : ``results/orion_diametre_aorte.json`` (profil par source),
+``results/orion_diametre_aorte.png`` (image de controle avant / apres),
+``results/orion_diametre_aorte.niveau.png`` (niveau de la bifurcation) et
+``results/orion_proposition_aorte.json`` : PROPOSITION de mesure au format
+``orion.proposition_mesure_imagerie/v1``, destinee au rapport d'imagerie
+d'Orion ou le medecin l'accepte (ou la rejette) AVANT toute signature. Rien
+n'y entre seul. La proposition n'est emise que si les deux segmentations
+concordent a ``CONCORDANCE_MAX_MM`` pres au niveau de la bifurcation ;
+sinon le fichier dit pourquoi et ne propose aucune valeur.
 """
 
 from __future__ import annotations
@@ -209,6 +216,17 @@ CAVITES_ET_ARTERE_PULMONAIRE = (45, 46, 47, 48, 49)
 LABEL_ARTERE_PULMONAIRE = 49
 BRANCHE_MIN_MM = 30.0
 ECART_NIVEAU_MAX_MM = 2.0
+SCHEMA_PROPOSITION = "orion.proposition_mesure_imagerie/v1"
+#: Ecart maximal (equivalent aire) entre MONAI et TotalSegmentator au niveau
+#: de la bifurcation pour emettre une proposition. Au-dela, l'une des deux
+#: segmentations se trompe et rien ne dit laquelle.
+CONCORDANCE_MAX_MM = 2.0
+LIMITES = [
+    "diametre INTRALUMINAL (lumiere opacifiee), pas de bord externe a bord externe",
+    "validation clinique non faite : un seul scanner public, aucune mesure de radiologue de reference",
+    "reperes de la racine (anneau, sinus, jonction sino-tubulaire) non localises",
+    "aide a la mesure NON certifiee (Research Use Only ; qualification SaMD en cours) : a confirmer par le medecin avant signature",
+]
 LABEL_MYOCARDE = 44
 MARGE_DENSITE_MM = 6.0
 CONVENTION = "intraluminal"
@@ -525,6 +543,96 @@ def image_du_niveau(
     plt.close(fig)
 
 
+def _version_git() -> str | None:
+    import subprocess
+
+    try:
+        sortie = subprocess.run(
+            ["git", "describe", "--always", "--dirty"],
+            cwd=Path(__file__).resolve().parent,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        return sortie.stdout.strip() or None
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
+def _empreinte(chemin: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with open(chemin, "rb") as f:
+        for bloc in iter(lambda: f.read(1 << 20), b""):
+            h.update(bloc)
+    return h.hexdigest()
+
+
+def proposition(niveau: dict, volume: Path) -> dict:
+    """Proposition de mesure au format v1, ou refus motive (aucune valeur).
+
+    La valeur proposee est le diametre MAXIMAL de la section, la plus proche
+    de l'usage clinique ; minimal et equivalent aire l'accompagnent. Le
+    medecin choisit dans Orion ce qu'il retient, et son interpretation.
+    """
+    from importlib.metadata import version
+
+    mesures = niveau["mesures"]
+    monai, ts = mesures.get("monai"), mesures.get("totalsegmentator")
+    base = {
+        "schema": SCHEMA_PROPOSITION,
+        "pipeline": {
+            "nom": "monai-physio/experiments/Heart-GatedCT_To_USD/orion_diametre_aorte.py",
+            "version_git": _version_git(),
+            "segmentation_mesure": f"TotalSegmentator {version('TotalSegmentator')}, tache ouverte `total`",
+            "segmentation_repere": "MONAI wholeBody_ct_segmentation, label 49 (artere pulmonaire)",
+            "controle": "MONAI wholeBody_ct_segmentation, label 7 (aorte)",
+        },
+        "examen": {"volume_sha256": _empreinte(volume), "date_examen": None},
+        "limites": LIMITES,
+    }
+    if not (monai and ts):
+        return {
+            **base,
+            "propositions": [],
+            "refus": "niveau de la bifurcation non atteint par les deux segmentations",
+        }
+    ecart = round(abs(ts["diametre_aire_mm"] - monai["diametre_aire_mm"]), 1)
+    if ecart > CONCORDANCE_MAX_MM:
+        return {
+            **base,
+            "propositions": [],
+            "refus": f"segmentations discordantes ({ecart} mm > {CONCORDANCE_MAX_MM} mm)",
+        }
+    return {
+        **base,
+        "propositions": [
+            {
+                "cle": "aorte_ascendante",
+                "valeur": ts["diametre_max_mm"],
+                "unite": "mm",
+                "indicateur": "diametre_maximal_section_perpendiculaire",
+                "convention": CONVENTION,
+                "niveau": "bifurcation_artere_pulmonaire",
+                "details_mm": {
+                    "maximal": ts["diametre_max_mm"],
+                    "minimal": ts["diametre_min_mm"],
+                    "equivalent_aire": ts["diametre_aire_mm"],
+                    "dispersion_aire_plus_moins_2mm": ts["dispersion_aire_mm"],
+                },
+                "concordance": {
+                    "controle_equivalent_aire_mm": monai["diametre_aire_mm"],
+                    "ecart_mm": ecart,
+                },
+                # Jamais d'interpretation : c'est au medecin de la donner.
+                "interpretation": None,
+            }
+        ],
+        "refus": None,
+    }
+
+
 def main() -> None:
     reference = itk.imread(str(RESULTATS / "orion_cavites.labelmap.mha"))
     labels = itk.array_from_image(reference)
@@ -565,6 +673,11 @@ def main() -> None:
         nom: ({k: v for k, v in m.items() if not k.startswith("_")} if m else None)
         for nom, m in au_niveau.items()
     }
+
+    prop = proposition(niveau, RESULTATS / "slice_fixed.mha")
+    (RESULTATS / "orion_proposition_aorte.json").write_text(
+        json.dumps(prop, indent=2), encoding="utf-8"
+    )
 
     sortie = {
         "convention": CONVENTION,

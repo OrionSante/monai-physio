@@ -128,3 +128,43 @@ def test_no_bifurcation_means_no_measurement_level():
     )
     with pytest.raises(SystemExit):
         module.bifurcation_pulmonaire(labels, SPACING)
+
+
+def _level(monai_area, ts_area):
+    section = {
+        "diametre_max_mm": 38.3,
+        "diametre_min_mm": 34.9,
+        "dispersion_aire_mm": 1.4,
+    }
+    return {
+        "mesures": {
+            "monai": None
+            if monai_area is None
+            else {**section, "diametre_aire_mm": monai_area},
+            "totalsegmentator": None
+            if ts_area is None
+            else {**section, "diametre_aire_mm": ts_area},
+        }
+    }
+
+
+def test_proposal_is_emitted_only_when_segmentations_agree(tmp_path):
+    module = _load()
+    volume = tmp_path / "volume.mha"
+    volume.write_bytes(b"scan")
+
+    agree = module.proposition(_level(35.6, 36.2), volume)
+    assert agree["schema"] == "orion.proposition_mesure_imagerie/v1"
+    assert agree["refus"] is None
+    (proposal,) = agree["propositions"]
+    assert proposal["cle"] == "aorte_ascendante"
+    assert proposal["convention"] == "intraluminal"
+    assert proposal["niveau"] == "bifurcation_artere_pulmonaire"
+    assert proposal["interpretation"] is None  # always the physician's call
+    assert len(agree["examen"]["volume_sha256"]) == 64
+
+    disagree = module.proposition(_level(33.0, 36.2), volume)
+    assert disagree["propositions"] == [] and "discordantes" in disagree["refus"]
+
+    missing = module.proposition(_level(None, 36.2), volume)
+    assert missing["propositions"] == [] and missing["refus"]
