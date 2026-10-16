@@ -37,6 +37,21 @@ Mesure (identique pour les trois) :
 4. Ecartes : 10 premiers et derniers mm de l'axe, et toute section qui touche
    le bord du champ scanne (vaisseau tronque, sous-estime).
 
+NIVEAU ANATOMIQUE STANDARD : BIFURCATION DE L'ARTERE PULMONAIRE
+Le maximum sur toute la longueur depend de jusqu'ou chaque segmentation
+descend dans la racine. La mesure de reference de l'aorte ascendante
+TUBULAIRE se prend au niveau de la bifurcation de l'artere pulmonaire :
+
+* bifurcation : sur le squelette 3D de l'artere pulmonaire (label 49 du
+  bundle MONAI, Apache 2.0 ; la tache ouverte `total` de TotalSegmentator ne
+  la segmente pas), amas de jonctions d'ou partent TROIS branches d'au moins
+  30 mm (tronc, artere pulmonaire droite et gauche) ; on retient la plus
+  equilibree (troisieme branche la plus longue). Aucune jonction de ce type :
+  pas de mesure ;
+* mesure : point de l'axe de l'aorte ascendante a la HAUTEUR (cranio-caudale)
+  de la bifurcation, section perpendiculaire a l'axe ; les sections a +/- 2 mm
+  donnent la dispersion locale.
+
 CE QUE CA NE DIT PAS
 - Reperes de la racine (anneau, sinus, jonction sino-tubulaire) : taches
   TotalSegmentator sous licence, NON localises ici.
@@ -191,6 +206,9 @@ def profil(masque_iso: np.ndarray, pas: float) -> list[dict]:
 
 
 CAVITES_ET_ARTERE_PULMONAIRE = (45, 46, 47, 48, 49)
+LABEL_ARTERE_PULMONAIRE = 49
+BRANCHE_MIN_MM = 30.0
+ECART_NIVEAU_MAX_MM = 2.0
 LABEL_MYOCARDE = 44
 MARGE_DENSITE_MM = 6.0
 CONVENTION = "intraluminal"
@@ -278,6 +296,104 @@ def masque_totalsegmentator(reference) -> tuple[np.ndarray, np.ndarray] | None:
     return labels == noms["aorta"], labels == noms["heart"]
 
 
+def bifurcation_pulmonaire(labels: np.ndarray, espacement: np.ndarray) -> dict:
+    """Point (mm, ordre z, y, x) de la bifurcation de l'artere pulmonaire."""
+    import networkx as nx
+    from skimage.morphology import skeletonize
+
+    ap = labels == LABEL_ARTERE_PULMONAIRE
+    composantes, n = ndimage.label(ap)
+    if n == 0:
+        raise SystemExit(
+            "Artere pulmonaire absente : niveau de bifurcation introuvable."
+        )
+    tailles = ndimage.sum(ap, composantes, range(1, n + 1))
+    ap = composantes == int(np.argmax(tailles)) + 1
+    iso = ndimage.binary_closing(
+        isotrope(ap, espacement, PAS_ISOTROPE_MM), iterations=2
+    )
+    points = np.argwhere(skeletonize(iso))
+    indice = {tuple(q): i for i, q in enumerate(points)}
+    voisins = [
+        (a, b, c)
+        for a in (-1, 0, 1)
+        for b in (-1, 0, 1)
+        for c in (-1, 0, 1)
+        if (a, b, c) != (0, 0, 0)
+    ]
+    graphe = nx.Graph()
+    for i, q in enumerate(points):
+        for d in voisins:
+            j = indice.get((q[0] + d[0], q[1] + d[1], q[2] + d[2]))
+            if j is not None:
+                graphe.add_edge(i, j, w=float(np.linalg.norm(d)) * PAS_ISOTROPE_MM)
+    graphe = graphe.subgraph(max(nx.connected_components(graphe), key=len)).copy()
+    jonctions = [v for v in graphe if graphe.degree(v) >= 3]
+    meilleur = None
+    for amas in nx.connected_components(graphe.subgraph(jonctions)):
+        reste = graphe.copy()
+        reste.remove_nodes_from(amas)
+        branches = sorted(
+            (
+                sum(reste.edges[e]["w"] for e in reste.subgraph(cc).edges)
+                for cc in nx.connected_components(reste)
+            ),
+            reverse=True,
+        )
+        if (
+            len(branches) >= 3
+            and branches[2] >= BRANCHE_MIN_MM
+            and (meilleur is None or branches[2] > meilleur[1][2])
+        ):
+            meilleur = (amas, branches)
+    if meilleur is None:
+        raise SystemExit(
+            "Aucune jonction a trois branches longues : bifurcation pulmonaire non identifiee."
+        )
+    amas, branches = meilleur
+    point = points[list(amas)].mean(axis=0) * PAS_ISOTROPE_MM
+    return {
+        "point_mm": [round(float(x), 1) for x in point],
+        "branches_mm": [round(b) for b in branches[:3]],
+    }
+
+
+def mesure_au_niveau(
+    ascendante: np.ndarray, espacement: np.ndarray, hauteur_mm: float
+) -> dict | None:
+    """Section de l'aorte ascendante a la hauteur `hauteur_mm` (axe z du volume)."""
+    iso = isotrope(ascendante, espacement, PAS_ISOTROPE_MM)
+    axe = axe_central(iso, PAS_ISOTROPE_MM)
+    k = int(np.argmin(np.abs(axe[:, 0] - hauteur_mm)))
+    if abs(axe[k, 0] - hauteur_mm) > ECART_NIVEAU_MAX_MM:
+        return None  # l'aorte mesuree n'atteint pas ce niveau
+    masque_f = ndimage.gaussian_filter(
+        iso.astype(np.float32), sigma=LISSAGE_MM / PAS_ISOTROPE_MM
+    )
+    sections = {}
+    for decalage in (-1, 0, 1):
+        j = k + decalage
+        if 0 <= j < len(axe):
+            tangente = axe[min(j + 2, len(axe) - 1)] - axe[max(j - 2, 0)]
+            sections[decalage] = section(masque_f, PAS_ISOTROPE_MM, axe[j], tangente)
+    centrale = sections.get(0)
+    if centrale is None:
+        return None
+    voisines = [m for m in sections.values() if m]
+    return {
+        **centrale,
+        "abscisse_mm": round(k * PAS_AXE_MM, 1),
+        "dispersion_aire_mm": round(
+            max(m["diametre_aire_mm"] for m in voisines)
+            - min(m["diametre_aire_mm"] for m in voisines),
+            1,
+        ),
+        "_axe": axe,
+        "_k": k,
+        "_iso": iso,
+    }
+
+
 def mesurer(ascendante: np.ndarray, espacement: np.ndarray) -> dict:
     iso = isotrope(ascendante, espacement, PAS_ISOTROPE_MM)
     lignes = profil(iso, PAS_ISOTROPE_MM)
@@ -353,6 +469,62 @@ def image_de_controle(
     plt.close(fig)
 
 
+def image_du_niveau(
+    niveau: dict,
+    mesures: dict,
+    ct: np.ndarray,
+    labels: np.ndarray,
+    espacement: np.ndarray,
+    chemin: Path,
+) -> None:
+    """Coupe coronale par la bifurcation, puis section de l'aorte a ce niveau par source."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ct_iso = ndimage.zoom(ct, espacement / PAS_ISOTROPE_MM, order=1)
+    ap_iso = isotrope(labels == LABEL_ARTERE_PULMONAIRE, espacement, PAS_ISOTROPE_MM)
+    z, y, x = (np.asarray(niveau["point_mm"]) / PAS_ISOTROPE_MM).round().astype(int)
+    fig, axes = plt.subplots(1, 1 + len(mesures), figsize=(5 * (1 + len(mesures)), 5))
+    axes[0].imshow(np.clip(ct_iso[:, y, :], -200, 700), cmap="gray", origin="lower")
+    axes[0].contour(ap_iso[:, y, :].astype(float), [0.5], colors="c", linewidths=1)
+    axes[0].axhline(z, color="y", linewidth=1)
+    axes[0].plot(x, z, "y+", markersize=14)
+    axes[0].set_title(f"bifurcation AP (cyan) : hauteur {niveau['point_mm'][0]} mm")
+    axes[0].axis("off")
+    grille = np.arange(-DEMI_SECTION_MM, DEMI_SECTION_MM + 1e-9, PAS_SECTION_MM)
+    a, b = np.meshgrid(grille, grille, indexing="ij")
+    for i, (nom, m) in enumerate(mesures.items()):
+        ax = axes[i + 1]
+        if m is None:
+            ax.set_title(f"{nom} : niveau non atteint")
+            ax.axis("off")
+            continue
+        axe, k = m["_axe"], m["_k"]
+        u, v = _base_orthonormee(axe[min(k + 2, len(axe) - 1)] - axe[max(k - 2, 0)])
+        coords = (
+            axe[k][:, None, None] + u[:, None, None] * a + v[:, None, None] * b
+        ) / PAS_ISOTROPE_MM
+        ax.imshow(
+            np.clip(ndimage.map_coordinates(ct_iso, coords, order=1), -200, 700),
+            cmap="gray",
+        )
+        ax.contour(
+            ndimage.map_coordinates(m["_iso"].astype(np.float32), coords, order=1),
+            [0.5],
+            colors="r",
+            linewidths=1,
+        )
+        ax.set_title(
+            f"{nom} : max {m['diametre_max_mm']} / min {m['diametre_min_mm']} / aire {m['diametre_aire_mm']}"
+        )
+        ax.axis("off")
+    plt.tight_layout()
+    plt.savefig(chemin, dpi=70)
+    plt.close(fig)
+
+
 def main() -> None:
     reference = itk.imread(str(RESULTATS / "orion_cavites.labelmap.mha"))
     labels = itk.array_from_image(reference)
@@ -383,8 +555,20 @@ def main() -> None:
             mesurer(ascendante_ts, espacement),
         )
 
+    niveau = bifurcation_pulmonaire(labels, espacement)
+    au_niveau = {
+        nom: mesure_au_niveau(masque, espacement, niveau["point_mm"][0])
+        for nom, (masque, _) in sources.items()
+        if nom != "densite"  # ecartee : fuit dans les cavites voisines
+    }
+    niveau["mesures"] = {
+        nom: ({k: v for k, v in m.items() if not k.startswith("_")} if m else None)
+        for nom, m in au_niveau.items()
+    }
+
     sortie = {
         "convention": CONVENTION,
+        "niveau_bifurcation_pulmonaire": niveau,
         "avertissement": AVERTISSEMENT,
         "methode": "sections perpendiculaires a l'axe, grille 0,2 mm, masque isotrope 0,6 mm",
         "sources": {
@@ -396,6 +580,14 @@ def main() -> None:
         json.dumps(sortie, indent=2), encoding="utf-8"
     )
     image_de_controle(sources, ct, espacement, RESULTATS / "orion_diametre_aorte.png")
+    image_du_niveau(
+        niveau,
+        au_niveau,
+        ct,
+        labels,
+        espacement,
+        RESULTATS / "orion_diametre_aorte.niveau.png",
+    )
     for nom, (_, mesure) in sources.items():
         m = mesure["maximum_aire"] if mesure["profil"] else None
         print(
@@ -408,6 +600,19 @@ def main() -> None:
         )
     if "densite" in details:
         print("seuils densite :", details["densite"])
+    print(
+        f"bifurcation pulmonaire : hauteur {niveau['point_mm'][0]} mm, branches {niveau['branches_mm']} mm"
+    )
+    for nom, m in niveau["mesures"].items():
+        print(
+            f"  {nom:17s} "
+            + (
+                f"max {m['diametre_max_mm']} / min {m['diametre_min_mm']} / aire {m['diametre_aire_mm']} mm "
+                f"(dispersion +/-2 mm : {m['dispersion_aire_mm']} mm)"
+                if m
+                else "niveau non atteint"
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -88,3 +88,43 @@ def test_sections_cut_by_the_field_of_view_are_discarded():
     assert profile, "the part inside the field of view should still be measured"
     for section in profile:
         assert abs(section["diametre_aire_mm"] - 32.0) <= TOLERANCE_MM
+
+
+def _segment(shape, start_mm, end_mm, radius_mm):
+    """Boolean mask of a straight tube between two points given in mm (z, y, x)."""
+    z, y, x = np.indices(shape).astype(float)
+    points = np.stack([z * SPACING[0], y * SPACING[1], x * SPACING[2]], axis=-1)
+    start, end = np.asarray(start_mm), np.asarray(end_mm)
+    direction = end - start
+    t = np.clip(((points - start) @ direction) / (direction @ direction), 0.0, 1.0)
+    closest = start + t[..., None] * direction
+    return np.linalg.norm(points - closest, axis=-1) <= radius_mm
+
+
+def test_pulmonary_bifurcation_is_found_at_the_branching_height():
+    """Trunk rising to 90 mm, then left and right branches: junction at ~90 mm."""
+    module = _load()
+    shape = (180, 220, 220)
+    trunk = _segment(shape, (20.0, 66.0, 66.0), (90.0, 66.0, 66.0), 12.0)
+    left = _segment(shape, (90.0, 66.0, 66.0), (100.0, 66.0, 116.0), 9.0)
+    right = _segment(shape, (90.0, 66.0, 66.0), (100.0, 66.0, 16.0), 9.0)
+    labels = np.zeros(shape, dtype=np.uint8)
+    labels[trunk | left | right] = module.LABEL_ARTERE_PULMONAIRE
+
+    found = module.bifurcation_pulmonaire(labels, SPACING)
+
+    assert abs(found["point_mm"][0] - 90.0) <= 5.0
+    assert len(found["branches_mm"]) == 3
+    assert min(found["branches_mm"]) >= module.BRANCHE_MIN_MM
+
+
+def test_no_bifurcation_means_no_measurement_level():
+    """A single straight vessel has no three-branch junction: refuse, do not guess."""
+    module = _load()
+    shape = (180, 120, 120)
+    labels = np.zeros(shape, dtype=np.uint8)
+    labels[_segment(shape, (20.0, 36.0, 36.0), (100.0, 36.0, 36.0), 12.0)] = (
+        module.LABEL_ARTERE_PULMONAIRE
+    )
+    with pytest.raises(SystemExit):
+        module.bifurcation_pulmonaire(labels, SPACING)
