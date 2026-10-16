@@ -69,6 +69,7 @@ if __name__ == "__main__":
         outname = "slice_max"
 
     seg = SegmentChestTotalSegmentatorWithContrast()
+    seg.set_fast_mode(True)  # Orion (CPU) : comme 1-register_images.py.
     if re_run_image_segmentation:
         result = seg.segment(max_image)
         labelmap_image = result["labelmap"]

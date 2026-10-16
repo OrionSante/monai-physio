@@ -18,7 +18,7 @@ if __name__ == "__main__":
 
     # Must match N_FRAMES / FRAME_STEP in 1-register_images.py
     N_FRAMES = 21
-    FRAME_STEP = 1
+    FRAME_STEP = 3  # Orion (CPU) : 7 phases sur 21, une sur trois.
 
     # %%
     output_dir = os.path.join(_HERE, "results")
